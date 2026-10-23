@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LensVoice</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px;
+    background: #10141c; color: #eef2fa;
+    font-family: Arial, sans-serif;
+  }
+  main { max-width: 650px; margin: auto; }
+  h1 { color: #7ce5c6; margin-bottom: 8px; }
+  p { line-height: 1.5; }
+  video {
+    display: block; width: 100%; min-height: 220px;
+    background: #000; border-radius: 16px; margin: 20px 0;
+  }
+  .buttons { display: flex; flex-wrap: wrap; gap: 10px; }
+  button, input {
+    font: inherit; padding: 14px;
+    border-radius: 10px; border: 1px solid #435068;
+  }
+  button { background: #263246; color: white; cursor: pointer; }
+  button.primary { background: #7ce5c6; color: #10141c; }
+  button:disabled { opacity: .45; cursor: default; }
+  label { display: block; margin: 20px 0 8px; }
+  input[type="url"] {
+    width: 100%; background: #192230; color: white;
+  }
+  .panel {
+    background: #192230; padding: 16px;
+    border-radius: 12px; margin-top: 18px;
+  }
+  .muted { color: #b6c2d4; font-size: 14px; }
+  summary { cursor: pointer; padding: 12px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LensVoice</h1>
+  <p>See through your camera. Hear a description.</p>
+
+  <video id="view" autoplay muted playsinline
+    aria-label="Live camera view"></video>
+
+  <div class="buttons">
+    <button id="start" class="primary">Start Camera</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="describe" disabled>Describe Now</button>
+    <button id="voice">Test Voice</button>
+  </div>
+
+  <label>
+    <input id="automatic" type="checkbox">
+    Automatically describe the view
+  </label>
+  <label>
+    <input id="spoken" type="checkbox" checked>
+    Speak descriptions
+  </label>
+
+  <div class="panel">
+    <strong>Status</strong>
+    <p id="status" role="status" aria-live="polite">
+      Ready. Start the camera to begin.
+    </p>
+  </div>
+
+  <div class="panel">
+    <strong>Description</strong>
+    <p id="description">No scene analyzed yet.</p>
+  </div>
+
+  <details>
+    <summary>AI connection settings</summary>
+    <label for="endpoint">Secure backend URL</label>
+    <input id="endpoint" type="url"
+      placeholder="https://your-backend.example/analyze"
+      autocomplete="off">
+    <p class="muted">
+      We will create this backend next. Enter its URL here,
+      never an OpenAI API key. This address is saved on this device.
+    </p>
+  </details>
+
+  <p id="connection" class="muted"></p>
+  <p class="muted">
+    No video recording is saved by this page. When analysis is
+    enabled, selected camera images are sent to your configured
+    backend and AI provider for processing.
+    Keep this page open and the screen awake.
+  </p>
+  <p class="muted">
+    Experimental descriptions may be delayed or incorrect.
+    Not for driving decisions, navigation, or collision warnings.
+  </p>
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const video = $("view");
+let stream = null;
+let session = 0;
+let timer = null;
+let controller = null;
+let busy = false;
+const interval = 8000;
+
+try {
+  $("endpoint").value = localStorage.getItem("lensvoiceEndpoint") || "";
+} catch (_) {}
+
+function backendURL() {
+  const value = $("endpoint").value.trim();
+  if (!value) return "";
+  const url = new URL(value);
+  if (url.protocol !== "https:") {
+    throw new Error("The backend URL must start with https://");
+  }
+  return url.href;
+}
+
+function updateConnection() {
+  $("connection").textContent = $("endpoint").value.trim()
+    ? "Backend address entered. Connection has not yet been verified."
+    : "AI is not connected yet. Camera and voice testing are available.";
+}
+
+$("endpoint").addEventListener("change", () => {
+  try {
+    backendURL();
+    localStorage.setItem("lensvoiceEndpoint", $("endpoint").value.trim());
+    updateConnection();
+  } catch (error) {
+    $("status").textContent = error.message;
+  }
+});
+
+function speak(text) {
+  if (!$("spoken").checked || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "en-US";
+  speechSynthesis.speak(utterance);
+}
+
+function schedule() {
+  clearTimeout(timer);
+  if (stream && $("automatic").checked && !busy) {
+    timer = setTimeout(analyze, interval);
+  }
+}
+
+function stopCamera(message = "Stopped.") {
+  session++;
+  clearTimeout(timer);
+  timer = null;
+  if (controller) controller.abort();
+  controller = null;
+  busy = false;
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  stream = null;
+  video.srcObject = null;
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("describe").disabled = true;
+  $("status").textContent = message;
+}
+
+$("start").addEventListener("click", async () => {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    $("status").textContent =
+      "Camera unavailable. Open the published HTTPS website.";
+    return;
+  }
+  const current = ++session;
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  $("status").textContent = "Waiting for camera permission…";
+  try {
+    const opened = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+    if (current !== session) {
+      opened.getTracks().forEach(track => track.stop());
+      return;
+    }
+    stream = opened;
+    video.srcObject = stream;
+    await video.play();
+    if (current !== session) return;
+    $("describe").disabled = false;
+    $("status").textContent =
+      "Camera live. Tap Describe Now, or enable automatic descriptions.";
+    schedule();
+  } catch (error) {
+    if (current === session) {
+      stopCamera("Camera could not start: " + error.message);
+    }
+  }
+});
+
+async function analyze() {
+  clearTimeout(timer);
+  if (!stream || busy) return;
+
+  let endpoint;
+  try {
+    endpoint = backendURL();
+    if (!endpoint) {
+      $("status").textContent =
+        "AI is not connected yet. We must set up the secure backend next.";
+      $("automatic").checked = false;
+      return;
+    }
+  } catch (error) {
+    $("status").textContent = error.message;
+    $("automatic").checked = false;
+    return;
+  }
+
+  if (!video.videoWidth || !video.videoHeight) {
+    $("status").textContent = "Camera image not ready. Try again.";
+    schedule();
+    return;
+  }
+
+  const current = session;
+  busy = true;
+  $("describe").disabled = true;
+  $("status").textContent = "Analyzing the current view…";
+
+  const canvas = document.createElement("canvas");
+  const scale = Math.min(1, 960 / video.videoWidth);
+  canvas.width = Math.round(video.videoWidth * scale);
+  canvas.height = Math.round(video.videoHeight * scale);
+  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+  const image = canvas.toDataURL("image/jpeg", 0.75);
+
+  const request = new AbortController();
+  controller = request;
+  const timeout = setTimeout(() => request.abort(), 25000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image }),
+      signal: request.signal,
+      credentials: "omit"
+    });
+
+    if (!response.ok) {
+      throw new Error("Backend returned HTTP " + response.status);
+    }
+
+    const result = await response.json();
+    if (typeof result.description !== "string" ||
+        !result.description.trim()) {
+      throw new Error("Backend did not return a description.");
+    }
+
+    if (current !== session) return;
+    const description = result.description.trim();
+    $("description").textContent = description;
+    $("status").textContent = "Description received.";
+    speak(description);
+  } catch (error) {
+    if (current !== session) return;
+    $("status").textContent = error.name === "AbortError"
+      ? "Analysis timed out. Automatic descriptions paused."
+      : "Analysis failed: " + error.message;
+    $("automatic").checked = false;
+  } finally {
+    clearTimeout(timeout);
+    if (current === session) {
+      controller = null;
+      busy = false;
+      $("describe").disabled = !stream;
+      schedule();
+    }
+  }
+}
+
+$("stop").addEventListener("click", () => stopCamera());
+$("describe").addEventListener("click", analyze);
+
+$("automatic").addEventListener("change", () => {
+  clearTimeout(timer);
+  if ($("automatic").checked && stream) analyze();
+});
+
+$("spoken").addEventListener("change", () => {
+  if (!$("spoken").checked && "speechSynthesis" in window) {
+    speechSynthesis.cancel();
+  }
+});
+
+$("voice").addEventListener("click", () => {
+  if (!("speechSynthesis" in window)) {
+    $("status").textContent = "Speech is unavailable in this browser.";
+    return;
+  }
+  speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(
+    "LensVoice audio test. Can you hear this clearly?"
+  );
+  utterance.lang = "en-US";
+  speechSynthesis.speak(utterance);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopCamera("Paused because the page was hidden.");
+});
+window.addEventListener("pagehide", () => stopCamera());
+updateConnection();
+</script>
+</body>
+</html>
