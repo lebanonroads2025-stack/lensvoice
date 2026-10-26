@@ -7,32 +7,48 @@
 <style>
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 24px 16px;
-    background: #10141c; color: #eef2fa;
+    margin: 0;
+    padding: 24px 16px;
+    background: #10141c;
+    color: #eef2fa;
     font-family: Arial, sans-serif;
   }
   main { max-width: 650px; margin: auto; }
   h1 { color: #7ce5c6; margin-bottom: 8px; }
   p { line-height: 1.5; }
   video {
-    display: block; width: 100%; min-height: 220px;
-    background: #000; border-radius: 16px; margin: 20px 0;
+    display: block;
+    width: 100%;
+    min-height: 220px;
+    background: #000;
+    border-radius: 16px;
+    margin: 20px 0;
   }
   .buttons { display: flex; flex-wrap: wrap; gap: 10px; }
   button, input {
-    font: inherit; padding: 14px;
-    border-radius: 10px; border: 1px solid #435068;
+    font: inherit;
+    padding: 14px;
+    border-radius: 10px;
+    border: 1px solid #435068;
   }
-  button { background: #263246; color: white; cursor: pointer; }
+  button {
+    background: #263246;
+    color: white;
+    cursor: pointer;
+  }
   button.primary { background: #7ce5c6; color: #10141c; }
   button:disabled { opacity: .45; cursor: default; }
   label { display: block; margin: 20px 0 8px; }
-  input[type="url"] {
-    width: 100%; background: #192230; color: white;
+  input[type="url"], input[type="password"] {
+    width: 100%;
+    background: #192230;
+    color: white;
   }
   .panel {
-    background: #192230; padding: 16px;
-    border-radius: 12px; margin-top: 18px;
+    background: #192230;
+    padding: 16px;
+    border-radius: 12px;
+    margin-top: 18px;
   }
   .muted { color: #b6c2d4; font-size: 14px; }
   summary { cursor: pointer; padding: 12px 0; }
@@ -57,6 +73,7 @@
     <input id="automatic" type="checkbox">
     Automatically describe the view
   </label>
+
   <label>
     <input id="spoken" type="checkbox" checked>
     Speak descriptions
@@ -74,25 +91,52 @@
     <p id="description">No scene analyzed yet.</p>
   </div>
 
-  <details>
+  <details open>
     <summary>AI connection settings</summary>
-    <label for="endpoint">Secure backend URL</label>
-    <input id="endpoint" type="url"
-      placeholder="https://your-backend.example/analyze"
-      autocomplete="off">
+
+    <label for="accessToken">Private access token</label>
+    <input id="accessToken" type="password"
+      placeholder="Enter your LensVoice access token"
+      autocomplete="off" spellcheck="false"
+      autocapitalize="none">
+
     <p class="muted">
-      We will create this backend next. Enter its URL here,
-      never an OpenAI API key. This address is saved on this device.
+      Enter the token saved in Cloudflare as ACCESS_TOKEN.
+      Never enter your OpenAI API key here.
+      This page does not save your token to browser storage.
+      Re-enter it after reloading or reopening the page.
     </p>
+
+    <label for="endpoint">Secure backend URL</label>
+    <input id="endpoint" type="url" readonly
+      aria-describedby="endpointNote">
+
+    <p id="endpointNote" class="muted">
+      Your Cloudflare backend address is already configured.
+      The token is sent only to this address.
+    </p>
+
+    <button id="check">Check Backend</button>
+    <button id="clearToken">Clear Token</button>
   </details>
 
-  <p id="connection" class="muted"></p>
+  <p id="connection" class="muted">
+    Backend connection has not yet been checked.
+  </p>
+
   <p class="muted">
-    No video recording is saved by this page. When analysis is
-    enabled, selected camera images are sent to your configured
-    backend and AI provider for processing.
+    No video recording is saved by this page.
+    When you request analysis, selected camera images are sent
+    to your backend and AI provider for processing.
     Keep this page open and the screen awake.
   </p>
+
+  <p class="muted">
+    Automatic mode waits eight seconds after each completed
+    request before checking again. It pauses after 20 successful
+    descriptions per camera session.
+  </p>
+
   <p class="muted">
     Experimental descriptions may be delayed or incorrect.
     Not for driving decisions, navigation, or collision warnings.
@@ -102,44 +146,23 @@
 <script>
 "use strict";
 
+const BACKEND =
+  "https://lensvoice-backend.lebanonroads2025.workers.dev/";
+
 const $ = id => document.getElementById(id);
 const video = $("view");
+
+$("endpoint").value = BACKEND;
+
 let stream = null;
 let session = 0;
 let timer = null;
 let controller = null;
 let busy = false;
+let descriptions = 0;
+
 const interval = 8000;
-
-try {
-  $("endpoint").value = localStorage.getItem("lensvoiceEndpoint") || "";
-} catch (_) {}
-
-function backendURL() {
-  const value = $("endpoint").value.trim();
-  if (!value) return "";
-  const url = new URL(value);
-  if (url.protocol !== "https:") {
-    throw new Error("The backend URL must start with https://");
-  }
-  return url.href;
-}
-
-function updateConnection() {
-  $("connection").textContent = $("endpoint").value.trim()
-    ? "Backend address entered. Connection has not yet been verified."
-    : "AI is not connected yet. Camera and voice testing are available.";
-}
-
-$("endpoint").addEventListener("change", () => {
-  try {
-    backendURL();
-    localStorage.setItem("lensvoiceEndpoint", $("endpoint").value.trim());
-    updateConnection();
-  } catch (error) {
-    $("status").textContent = error.message;
-  }
-});
+const automaticLimit = 20;
 
 function speak(text) {
   if (!$("spoken").checked || !("speechSynthesis" in window)) return;
@@ -149,24 +172,46 @@ function speak(text) {
   speechSynthesis.speak(utterance);
 }
 
+function pauseAutomatic() {
+  clearTimeout(timer);
+  timer = null;
+  $("automatic").checked = false;
+}
+
 function schedule() {
   clearTimeout(timer);
-  if (stream && $("automatic").checked && !busy) {
-    timer = setTimeout(analyze, interval);
+  timer = null;
+
+  if (!stream || !$("automatic").checked || busy) return;
+
+  if (descriptions >= automaticLimit) {
+    pauseAutomatic();
+    $("status").textContent =
+      "Automatic descriptions paused after 20 results. " +
+      "You can still use Describe Now.";
+    return;
   }
+
+  timer = setTimeout(analyze, interval);
 }
 
 function stopCamera(message = "Stopped.") {
   session++;
-  clearTimeout(timer);
-  timer = null;
+  pauseAutomatic();
+
   if (controller) controller.abort();
   controller = null;
   busy = false;
-  if (stream) stream.getTracks().forEach(track => track.stop());
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+  }
+
   stream = null;
   video.srcObject = null;
+
   if ("speechSynthesis" in window) speechSynthesis.cancel();
+
   $("start").disabled = false;
   $("stop").disabled = true;
   $("describe").disabled = true;
@@ -179,10 +224,12 @@ $("start").addEventListener("click", async () => {
       "Camera unavailable. Open the published HTTPS website.";
     return;
   }
+
   const current = ++session;
   $("start").disabled = true;
   $("stop").disabled = false;
   $("status").textContent = "Waiting for camera permission…";
+
   try {
     const opened = await navigator.mediaDevices.getUserMedia({
       video: {
@@ -192,17 +239,23 @@ $("start").addEventListener("click", async () => {
       },
       audio: false
     });
+
     if (current !== session) {
       opened.getTracks().forEach(track => track.stop());
       return;
     }
+
     stream = opened;
     video.srcObject = stream;
     await video.play();
+
     if (current !== session) return;
+
+    descriptions = 0;
     $("describe").disabled = false;
     $("status").textContent =
-      "Camera live. Tap Describe Now, or enable automatic descriptions.";
+      "Camera live. Enter your private token before requesting analysis.";
+
     schedule();
   } catch (error) {
     if (current === session) {
@@ -211,22 +264,58 @@ $("start").addEventListener("click", async () => {
   }
 });
 
+$("check").addEventListener("click", async () => {
+  $("check").disabled = true;
+  $("connection").textContent = "Checking backend…";
+
+  const checkController = new AbortController();
+  const timeout = setTimeout(() => checkController.abort(), 10000);
+
+  try {
+    const response = await fetch(BACKEND, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "omit",
+      signal: checkController.signal
+    });
+
+    if (!response.ok) throw new Error("HTTP " + response.status);
+
+    const result = await response.json();
+
+    if (
+      result.service !== "LensVoice backend" ||
+      result.status !== "Online"
+    ) {
+      throw new Error("Unexpected backend response.");
+    }
+
+    $("connection").textContent =
+      "Backend is online. This check does not verify the token, " +
+      "API credits, or whether AI is enabled.";
+  } catch (error) {
+    $("connection").textContent =
+      "Backend check failed: " +
+      (error.name === "AbortError" ? "Request timed out." : error.message);
+  } finally {
+    clearTimeout(timeout);
+    $("check").disabled = false;
+  }
+});
+
 async function analyze() {
   clearTimeout(timer);
+  timer = null;
+
   if (!stream || busy) return;
 
-  let endpoint;
-  try {
-    endpoint = backendURL();
-    if (!endpoint) {
-      $("status").textContent =
-        "AI is not connected yet. We must set up the secure backend next.";
-      $("automatic").checked = false;
-      return;
-    }
-  } catch (error) {
-    $("status").textContent = error.message;
-    $("automatic").checked = false;
+  const accessToken = $("accessToken").value.trim();
+
+  if (!accessToken) {
+    pauseAutomatic();
+    $("status").textContent =
+      "Enter your private LensVoice access token in AI connection settings.";
+    $("accessToken").focus();
     return;
   }
 
@@ -237,53 +326,101 @@ async function analyze() {
   }
 
   const current = session;
+  const request = new AbortController();
+  controller = request;
   busy = true;
   $("describe").disabled = true;
   $("status").textContent = "Analyzing the current view…";
 
-  const canvas = document.createElement("canvas");
-  const scale = Math.min(1, 960 / video.videoWidth);
-  canvas.width = Math.round(video.videoWidth * scale);
-  canvas.height = Math.round(video.videoHeight * scale);
-  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-  const image = canvas.toDataURL("image/jpeg", 0.75);
-
-  const request = new AbortController();
-  controller = request;
   const timeout = setTimeout(() => request.abort(), 25000);
 
   try {
-    const response = await fetch(endpoint, {
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(
+      1,
+      960 / Math.max(video.videoWidth, video.videoHeight)
+    );
+
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not prepare camera image.");
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const image = canvas.toDataURL("image/jpeg", 0.75);
+
+    const response = await fetch(BACKEND, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + accessToken
+      },
       body: JSON.stringify({ image }),
       signal: request.signal,
-      credentials: "omit"
+      credentials: "omit",
+      cache: "no-store",
+      redirect: "error"
     });
 
+    const result = await response.json().catch(() => ({}));
+
     if (!response.ok) {
-      throw new Error("Backend returned HTTP " + response.status);
+      if (response.status === 401) {
+        throw new Error(
+          "Access denied. Check that your token matches Cloudflare ACCESS_TOKEN."
+        );
+      }
+
+      if (response.status === 503) {
+        throw new Error(
+          "AI is still disabled or missing private backend settings."
+        );
+      }
+
+      if (response.status === 429) {
+        throw new Error("Request limit reached. Wait before trying again.");
+      }
+
+      if (result.upstream_status === 429) {
+        throw new Error(
+          "OpenAI reported a credit or rate-limit issue. Check API billing and limits."
+        );
+      }
+
+      throw new Error(
+        result.error || "Backend returned HTTP " + response.status
+      );
     }
 
-    const result = await response.json();
-    if (typeof result.description !== "string" ||
-        !result.description.trim()) {
+    if (
+      typeof result.description !== "string" ||
+      !result.description.trim()
+    ) {
       throw new Error("Backend did not return a description.");
     }
 
     if (current !== session) return;
+
     const description = result.description.trim();
+    descriptions++;
+
     $("description").textContent = description;
-    $("status").textContent = "Description received.";
+    $("status").textContent =
+      "Description received. Results this session: " + descriptions + ".";
+
     speak(description);
   } catch (error) {
     if (current !== session) return;
-    $("status").textContent = error.name === "AbortError"
-      ? "Analysis timed out. Automatic descriptions paused."
-      : "Analysis failed: " + error.message;
-    $("automatic").checked = false;
+
+    pauseAutomatic();
+    $("status").textContent =
+      error.name === "AbortError"
+        ? "Analysis timed out. Automatic descriptions paused."
+        : "Analysis paused: " + error.message;
   } finally {
     clearTimeout(timeout);
+
     if (current === session) {
       controller = null;
       busy = false;
@@ -298,7 +435,18 @@ $("describe").addEventListener("click", analyze);
 
 $("automatic").addEventListener("change", () => {
   clearTimeout(timer);
-  if ($("automatic").checked && stream) analyze();
+
+  if (!$("automatic").checked) return;
+
+  if (descriptions >= automaticLimit) {
+    pauseAutomatic();
+    $("status").textContent =
+      "Automatic limit reached for this camera session. " +
+      "Use Describe Now, or stop and restart the camera.";
+    return;
+  }
+
+  if (stream) analyze();
 });
 
 $("spoken").addEventListener("change", () => {
@@ -307,24 +455,37 @@ $("spoken").addEventListener("change", () => {
   }
 });
 
+$("clearToken").addEventListener("click", () => {
+  stopCamera("Camera stopped and private token cleared.");
+  $("accessToken").value = "";
+});
+
 $("voice").addEventListener("click", () => {
   if (!("speechSynthesis" in window)) {
     $("status").textContent = "Speech is unavailable in this browser.";
     return;
   }
+
   speechSynthesis.cancel();
+
   const utterance = new SpeechSynthesisUtterance(
     "LensVoice audio test. Can you hear this clearly?"
   );
+
   utterance.lang = "en-US";
   speechSynthesis.speak(utterance);
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopCamera("Paused because the page was hidden.");
+  if (document.hidden) {
+    stopCamera("Paused because the page was hidden.");
+  }
 });
-window.addEventListener("pagehide", () => stopCamera());
-updateConnection();
+
+window.addEventListener("pagehide", () => {
+  stopCamera();
+  $("accessToken").value = "";
+});
 </script>
 </body>
 </html>
